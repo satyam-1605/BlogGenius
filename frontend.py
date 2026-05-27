@@ -3,9 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
-import zipfile
 from datetime import date
-from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Optional, List, Iterator, Tuple
 
@@ -28,29 +26,6 @@ def safe_slug(title: str) -> str:
     s = re.sub(r"[^a-z0-9 _-]+", "", s)
     s = re.sub(r"\s+", "_", s).strip("_")
     return s or "blog"
-
-
-def bundle_zip(md_text: str, md_filename: str, images_dir: Path) -> bytes:
-    buf = BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        z.writestr(md_filename, md_text.encode("utf-8"))
-
-        if images_dir.exists() and images_dir.is_dir():
-            for p in images_dir.rglob("*"):
-                if p.is_file():
-                    z.write(p, arcname=str(p))
-    return buf.getvalue()
-
-
-def images_zip(images_dir: Path) -> Optional[bytes]:
-    if not images_dir.exists() or not images_dir.is_dir():
-        return None
-    buf = BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        for p in images_dir.rglob("*"):
-            if p.is_file():
-                z.write(p, arcname=str(p))
-    return buf.getvalue()
 
 
 def try_stream(graph_app, inputs: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
@@ -91,75 +66,7 @@ def extract_latest_state(current_state: Dict[str, Any], step_payload: Any) -> Di
 
 
 # -----------------------------
-# Markdown renderer that supports local images
-# -----------------------------
-_MD_IMG_RE = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<src>[^)]+)\)")
-_CAPTION_LINE_RE = re.compile(r"^\*(?P<cap>.+)\*$")
-
-
-def _resolve_image_path(src: str) -> Path:
-    src = src.strip().lstrip("./")
-    return Path(src).resolve()
-
-
-def render_markdown_with_local_images(md: str):
-    matches = list(_MD_IMG_RE.finditer(md))
-    if not matches:
-        st.markdown(md, unsafe_allow_html=False)
-        return
-
-    parts: List[Tuple[str, str]] = []
-    last = 0
-    for m in matches:
-        before = md[last : m.start()]
-        if before:
-            parts.append(("md", before))
-
-        alt = (m.group("alt") or "").strip()
-        src = (m.group("src") or "").strip()
-        parts.append(("img", f"{alt}|||{src}"))
-        last = m.end()
-
-    tail = md[last:]
-    if tail:
-        parts.append(("md", tail))
-
-    i = 0
-    while i < len(parts):
-        kind, payload = parts[i]
-
-        if kind == "md":
-            st.markdown(payload, unsafe_allow_html=False)
-            i += 1
-            continue
-
-        alt, src = payload.split("|||", 1)
-
-        caption = None
-        if i + 1 < len(parts) and parts[i + 1][0] == "md":
-            nxt = parts[i + 1][1].lstrip()
-            if nxt.strip():
-                first_line = nxt.splitlines()[0].strip()
-                mcap = _CAPTION_LINE_RE.match(first_line)
-                if mcap:
-                    caption = mcap.group("cap").strip()
-                    rest = "\n".join(nxt.splitlines()[1:])
-                    parts[i + 1] = ("md", rest)
-
-        if src.startswith("http://") or src.startswith("https://"):
-            st.image(src, caption=caption or (alt or None), use_container_width=True)
-        else:
-            img_path = _resolve_image_path(src)
-            if img_path.exists():
-                st.image(str(img_path), caption=caption or (alt or None), use_container_width=True)
-            else:
-                st.warning(f"Image not found: `{src}` (looked for `{img_path}`)")
-
-        i += 1
-
-
-# -----------------------------
-# ✅ NEW: Past blogs helpers
+# Past blogs helpers
 # -----------------------------
 def list_past_blogs() -> List[Path]:
     """
@@ -203,7 +110,6 @@ with st.sidebar:
     as_of = st.date_input("As-of date", value=date.today())
     run_btn = st.button("🚀 Generate Blog", type="primary")
 
-    # ✅ NEW: Past blogs list (keeps everything else intact)
     st.divider()
     st.subheader("Past blogs")
 
@@ -240,26 +146,23 @@ with st.sidebar:
                 st.session_state["last_out"] = {
                     "plan": None,          # old files don't include plan
                     "evidence": [],        # old files don't include evidence
-                    "image_specs": [],     # optional (not persisted)
                     "final": md_text,      # markdown body
                 }
-                # also update the topic input to the title (best-effort) without changing UI
+                # update the topic input to the title (best-effort) without changing UI
                 st.session_state["topic_prefill"] = extract_title_from_md(md_text, selected_md_file.stem)
 
-    
 
 # Keep your topic input as-is; optionally prefill for next run after loading a blog
 if "topic_prefill" in st.session_state and isinstance(st.session_state["topic_prefill"], str):
-    # Do not mutate widgets; just keep as a hint.
     pass
 
 # Storage for latest run
 if "last_out" not in st.session_state:
     st.session_state["last_out"] = None
 
-# Layout
-tab_plan, tab_evidence, tab_preview, tab_images, tab_logs = st.tabs(
-    ["🧩 Plan", "🔎 Evidence", "📝 Markdown Preview", "🖼️ Images", "🧾 Logs"]
+# Layout (Removed Images Tab)
+tab_plan, tab_evidence, tab_preview, tab_logs = st.tabs(
+    ["🧩 Plan", "🔎 Evidence", "📝 Markdown Preview", "🧾 Logs"]
 )
 
 logs: List[str] = []
@@ -274,6 +177,7 @@ if run_btn:
         st.warning("Please enter a topic.")
         st.stop()
 
+    # Cleaned inputs dictionary
     inputs: Dict[str, Any] = {
         "topic": topic.strip(),
         "mode": "",
@@ -284,9 +188,6 @@ if run_btn:
         "as_of": as_of.isoformat(),
         "recency_days": 7,
         "sections": [],
-        "merged_md": "",
-        "md_with_placeholders": "",
-        "image_specs": [],
         "final": "",
     }
 
@@ -313,7 +214,6 @@ if run_btn:
                 "queries": current_state.get("queries", [])[:5] if isinstance(current_state.get("queries"), list) else [],
                 "evidence_count": len(current_state.get("evidence", []) or []),
                 "tasks": len((current_state.get("plan") or {}).get("tasks", [])) if isinstance(current_state.get("plan"), dict) else None,
-                "images": len(current_state.get("image_specs", []) or []),
                 "sections_done": len(current_state.get("sections", []) or []),
             }
             progress_area.json(summary)
@@ -398,7 +298,8 @@ if out:
         if not final_md:
             st.warning("No final markdown found.")
         else:
-            render_markdown_with_local_images(final_md)
+            # Replaced custom image rendering with standard Streamlit markdown
+            st.markdown(final_md, unsafe_allow_html=False)
 
             plan_obj = out.get("plan")
             if hasattr(plan_obj, "blog_title"):
@@ -410,50 +311,14 @@ if out:
                 blog_title = extract_title_from_md(final_md, "blog")
 
             md_filename = f"{safe_slug(blog_title)}.md"
+            
+            # Left only the direct Markdown download button
             st.download_button(
                 "⬇️ Download Markdown",
                 data=final_md.encode("utf-8"),
                 file_name=md_filename,
                 mime="text/markdown",
             )
-
-            bundle = bundle_zip(final_md, md_filename, Path("images"))
-            st.download_button(
-                "📦 Download Bundle (MD + images)",
-                data=bundle,
-                file_name=f"{safe_slug(blog_title)}_bundle.zip",
-                mime="application/zip",
-            )
-
-    # --- Images tab ---
-    with tab_images:
-        st.subheader("Images")
-        specs = out.get("image_specs") or []
-        images_dir = Path("images")
-
-        if not specs and not images_dir.exists():
-            st.info("No images generated for this blog.")
-        else:
-            if specs:
-                st.write("**Image plan:**")
-                st.json(specs)
-
-            if images_dir.exists():
-                files = [p for p in images_dir.iterdir() if p.is_file()]
-                if not files:
-                    st.warning("images/ exists but is empty.")
-                else:
-                    for p in sorted(files):
-                        st.image(str(p), caption=p.name, use_container_width=True)
-
-                z = images_zip(images_dir)
-                if z:
-                    st.download_button(
-                        "⬇️ Download Images (zip)",
-                        data=z,
-                        file_name="images.zip",
-                        mime="application/zip",
-                    )
 
     # --- Logs tab ---
     with tab_logs:

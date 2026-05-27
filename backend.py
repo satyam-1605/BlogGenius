@@ -7,7 +7,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import TypedDict, List, Optional, Literal, Annotated
 
-from pydantic import BaseModel, Field, Strict
+from pydantic import BaseModel, Field
 
 # pyrefly: ignore [missing-import]
 from langgraph.graph import StateGraph, START, END
@@ -15,22 +15,18 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 
 # pyrefly: ignore [missing-import]
-from langchain_google_genai import ChatGoogleGenerativeAI
-# pyrefly: ignore [missing-import]
 from langchain_core.messages import SystemMessage, HumanMessage
 # pyrefly: ignore [missing-import]
 from langchain_groq import ChatGroq
 # pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
 
-load_dotenv()   
+load_dotenv()  
 
 # ============================================================
-# Blog Writer (Router → (Research?) → Orchestrator → Workers → ReducerWithImages)
-# Patches image capability using your 3-node reducer flow:
-#   merge_content -> decide_images -> generate_and_place_images
+# Blog Writer (Router → (Research?) → Orchestrator → Workers → Reducer)
+# Text-only pipeline optimized for high-quality technical prose
 # ============================================================
-
 
 # -----------------------------
 # 1) Schemas
@@ -77,21 +73,6 @@ class EvidencePack(BaseModel):
     evidence: List[EvidenceItem] = Field(default_factory=list)
 
 
-# ---- Image planning schema (ported from your image flow) ----
-class ImageSpec(BaseModel):
-    placeholder: str = Field(..., description="e.g. [[IMAGE_1]]")
-    filename: str = Field(..., description="Save under images/, e.g. qkv_flow.png")
-    alt: str
-    caption: str
-    prompt: str = Field(..., description="Prompt to send to the image model.")
-    size: Literal["1024x1024", "1024x1536", "1536x1024"] = "1024x1024"
-    quality: Literal["low", "medium", "high"] = "medium"
-
-
-class GlobalImagePlan(BaseModel):
-    md_with_placeholders: str
-    images: List[ImageSpec] = Field(default_factory=list)
-
 class State(TypedDict):
     topic: str
 
@@ -109,11 +90,6 @@ class State(TypedDict):
     # workers
     sections: Annotated[List[tuple[int, str]], operator.add]  # (task_id, section_md)
 
-    # reducer/image
-    merged_md: str
-    md_with_placeholders: str
-    image_specs: List[dict]
-
     final: str
 
 
@@ -122,7 +98,6 @@ class State(TypedDict):
 # -----------------------------
 llm = ChatGroq(
     model_name="llama-3.3-70b-versatile",
-
 )
 
 # -----------------------------
@@ -143,7 +118,7 @@ If needs_research=true:
 """
 
 def router_node(state: State) -> dict:
-    decider = llm.with_structured_output(RouterDecision,strict=True)
+    decider = llm.with_structured_output(RouterDecision, strict=True)
     decision = decider.invoke(
         [
             SystemMessage(content=ROUTER_SYSTEM),
@@ -223,7 +198,7 @@ def research_node(state: State) -> dict:
     if not raw:
         return {"evidence": []}
 
-    extractor = llm.with_structured_output(EvidencePack,Strict=True)
+    extractor = llm.with_structured_output(EvidencePack, strict=True)
     pack = extractor.invoke(
         [
             SystemMessage(content=RESEARCH_SYSTEM),
@@ -272,7 +247,7 @@ Output must match Plan schema.
 """
 
 def orchestrator_node(state: State) -> dict:
-    planner = llm.with_structured_output(Plan,strict=True)
+    planner = llm.with_structured_output(Plan, strict=True)
     mode = state.get("mode", "closed_book")
     evidence = state.get("evidence", [])
 
@@ -384,178 +359,41 @@ def worker_node(payload: dict) -> dict:
 
     return {"sections": [(task.id, section_md)]}
 
-# ============================================================
-# 8) ReducerWithImages (subgraph)
-#    merge_content -> decide_images -> generate_and_place_images
-# ============================================================
-def merge_content(state: State) -> dict:
-    plan = state["plan"]
-    if plan is None:
-        raise ValueError("merge_content called without plan.")
-    ordered_sections = [md for _, md in sorted(state["sections"], key=lambda x: x[0])]
-    body = "\n\n".join(ordered_sections).strip()
-    merged_md = f"# {plan.blog_title}\n\n{body}\n"
-    return {"merged_md": merged_md}
-
-
-DECIDE_IMAGES_SYSTEM = """You are an expert technical editor.
-Decide if images/diagrams are needed for THIS blog.
-
-Rules:
-- Max 3 images total.
-- Each image must materially improve understanding (diagram/flow/table-like visual).
-- Insert placeholders exactly: [[IMAGE_1]], [[IMAGE_2]], [[IMAGE_3]].
-- If no images needed: md_with_placeholders must equal input and images=[].
-- Avoid decorative images; prefer technical diagrams with short labels.
-Return strictly GlobalImagePlan.
-"""
-
-def decide_images(state: State) -> dict:
-    planner = llm.with_structured_output(GlobalImagePlan,strict=True)
-    merged_md = state["merged_md"]
-    plan = state["plan"]
-    assert plan is not None
-
-    image_plan = planner.invoke(
-        [
-            SystemMessage(content=DECIDE_IMAGES_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"Blog kind: {plan.blog_kind}\n"
-                    f"Topic: {state['topic']}\n\n"
-                    "Insert placeholders + propose image prompts.\n\n"
-                    f"{merged_md}"
-                )
-            ),
-        ]
-    )
-
-    return {
-        "md_with_placeholders": image_plan.md_with_placeholders,
-        "image_specs": [img.model_dump() for img in image_plan.images],
-    }
-
-
-def _gemini_generate_image_bytes(prompt: str) -> bytes:
-    """
-    Returns raw image bytes generated by Gemini.
-    Requires: pip install google-genai
-    Env var: GOOGLE_API_KEY
-    """
-    from google import genai
-    # pyrefly: ignore [missing-import]
-    from google.genai import types
-
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY is not set.")
-
-    client = genai.Client(api_key=api_key)
-
-    resp = client.models.generate_content(
-        model="gemini-2.5-flash-image",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_modalities=["IMAGE"],
-            safety_settings=[
-                types.SafetySetting(
-                    category="HARM_CATEGORY_DANGEROUS_CONTENT",
-                    threshold="BLOCK_ONLY_HIGH",
-                )
-            ],
-        ),
-    )
-
-    # Depending on SDK version, parts may hang off resp.candidates[0].content.parts
-    parts = getattr(resp, "parts", None)
-    if not parts and getattr(resp, "candidates", None):
-        try:
-            parts = resp.candidates[0].content.parts
-        except Exception:
-            parts = None
-
-    if not parts:
-        raise RuntimeError("No image content returned (safety/quota/SDK change).")
-
-    for part in parts:
-        inline = getattr(part, "inline_data", None)
-        if inline and getattr(inline, "data", None):
-            return inline.data
-
-    raise RuntimeError("No inline image bytes found in response.")
-
-
+# -----------------------------
+# 8) Reducer (Assembles Text and Saves Markdown File)
+# -----------------------------
 def _safe_slug(title: str) -> str:
     s = title.strip().lower()
     s = re.sub(r"[^a-z0-9 _-]+", "", s)
     s = re.sub(r"\s+", "_", s).strip("_")
     return s or "blog"
 
-
-def generate_and_place_images(state: State) -> dict:
+def reducer_node(state: State) -> dict:
     plan = state["plan"]
-    assert plan is not None
-
-    md = state.get("md_with_placeholders") or state["merged_md"]
-    image_specs = state.get("image_specs", []) or []
-
-    # If no images requested, just write merged markdown
-    if not image_specs:
-        filename = f"{_safe_slug(plan.blog_title)}.md"
-        Path(filename).write_text(md, encoding="utf-8")
-        return {"final": md}
-
-    images_dir = Path("images")
-    images_dir.mkdir(exist_ok=True)
-
-    for spec in image_specs:
-        placeholder = spec["placeholder"]
-        filename = spec["filename"]
-        out_path = images_dir / filename
-
-        # generate only if needed
-        if not out_path.exists():
-            try:
-                img_bytes = _gemini_generate_image_bytes(spec["prompt"])
-                out_path.write_bytes(img_bytes)
-            except Exception as e:
-                # graceful fallback: keep doc usable
-                prompt_block = (
-                    f"> **[IMAGE GENERATION FAILED]** {spec.get('caption','')}\n>\n"
-                    f"> **Alt:** {spec.get('alt','')}\n>\n"
-                    f"> **Prompt:** {spec.get('prompt','')}\n>\n"
-                    f"> **Error:** {e}\n"
-                )
-                md = md.replace(placeholder, prompt_block)
-                continue
-
-        img_md = f"![{spec['alt']}](images/{filename})\n*{spec['caption']}*"
-        md = md.replace(placeholder, img_md)
-
+    if plan is None:
+        raise ValueError("reducer_node called without a plan.")
+        
+    # Sort paragraphs cleanly by task order
+    ordered_sections = [md for _, md in sorted(state["sections"], key=lambda x: x[0])]
+    body = "\n\n".join(ordered_sections).strip()
+    final_md = f"# {plan.blog_title}\n\n{body}\n"
+    
+    # Save text file straight to local environment
     filename = f"{_safe_slug(plan.blog_title)}.md"
-    Path(filename).write_text(md, encoding="utf-8")
-    return {"final": md}
+    Path(filename).write_text(final_md, encoding="utf-8")
+    
+    return {"final": final_md}
 
-# build reducer subgraph
-reducer_graph = StateGraph(State)
-reducer_graph.add_node("merge_content", merge_content)
-reducer_graph.add_node("decide_images", decide_images)
-reducer_graph.add_node("generate_and_place_images", generate_and_place_images)
-reducer_graph.add_edge(START, "merge_content")
-reducer_graph.add_edge("merge_content", "decide_images")
-reducer_graph.add_edge("decide_images", "generate_and_place_images")
-reducer_graph.add_edge("generate_and_place_images", END)
-reducer_subgraph = reducer_graph.compile()
 
 # -----------------------------
-# 9) Build main graph
+# 9) Build Graph
 # -----------------------------
 g = StateGraph(State)
 g.add_node("router", router_node)
 g.add_node("research", research_node)
 g.add_node("orchestrator", orchestrator_node)
 g.add_node("worker", worker_node)
-g.add_node("reducer", reducer_subgraph)
+g.add_node("reducer", reducer_node)
 
 g.add_edge(START, "router")
 g.add_conditional_edges("router", route_next, {"research": "research", "orchestrator": "orchestrator"})
@@ -566,4 +404,3 @@ g.add_edge("worker", "reducer")
 g.add_edge("reducer", END)
 
 app = g.compile()
-app
