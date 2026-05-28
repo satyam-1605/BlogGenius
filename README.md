@@ -1,4 +1,5 @@
 # BlogGenius 🚀
+ live link:https://bloggenius-16.streamlit.app/
 
 **BlogGenius** is a premium, multi-agent AI blog writing workstation built on top of [LangGraph](https://github.com/langchain-ai/langgraph) and [Streamlit](https://streamlit.io). It automates high-quality technical article drafting by routing, researching, outlines structuring, parallel section-writing, and final article assembly.
 
